@@ -27,6 +27,12 @@ type ResetPasswordValues = z.infer<typeof schema>;
 
 type ResetStatus = 'checking' | 'available' | 'unavailable' | 'submitting' | 'done' | 'error';
 
+const RESET_ERROR_CODES = new Set([
+  'invalid_reset_token',
+  'firebase_update_failed',
+  'firebase_not_configured',
+]);
+
 export function ResetPasswordForm() {
   const { t } = useTranslation();
   const { signIn } = useAuth();
@@ -72,8 +78,12 @@ export function ResetPasswordForm() {
       setStatus('done');
     } catch (error) {
       const code = error instanceof Error && 'code' in error ? (error as { code: string }).code : '';
-      if (code === 'invalid_reset_token' || code === 'firebase_update_failed') {
-        setErrorMsg(t(`auth.errors.${code === 'invalid_reset_token' ? 'invalidResetToken' : 'firebaseUpdateFailed'}`));
+      if (code === 'invalid_reset_token') {
+        setErrorMsg(t('auth.errors.invalidResetToken'));
+      } else if (code === 'firebase_update_failed') {
+        setErrorMsg(t('auth.errors.firebaseUpdateFailed'));
+      } else if (code === 'firebase_not_configured') {
+        setErrorMsg(t('auth.errors.firebaseNotConfigured'));
       } else {
         setErrorMsg(t('auth.errors.generic'));
       }

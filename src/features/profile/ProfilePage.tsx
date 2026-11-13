@@ -25,7 +25,7 @@ const PASSWORD_PATTERN = /^(?=.*[A-Z])(?=.*[a-z])(?=.*\d)(?=.*[^A-Za-z\d]).{8,12
 
 type ProfileStatus = 'idle' | 'saved' | 'resetSent' | 'requestSent' | 'pending' | 'error';
 type SaveError = 'generic' | 'invalidPhone' | 'invalidName' | 'network';
-type ResetError = 'invalidToken' | 'firebaseFailed' | 'generic';
+type ResetError = 'invalidToken' | 'firebaseFailed' | 'firebaseNotConfigured' | 'generic';
 
 function profileSaveError(error: unknown): SaveError {
   if (error instanceof RosterError) {
@@ -160,6 +160,7 @@ export function ProfilePage() {
       if (error instanceof RosterError) {
         if (error.code === 'invalid_reset_token') setResetError('invalidToken');
         else if (error.code === 'firebase_update_failed') setResetError('firebaseFailed');
+        else if (error.code === 'firebase_not_configured') setResetError('firebaseNotConfigured');
         else setResetError('generic');
       } else {
         setResetError('generic');

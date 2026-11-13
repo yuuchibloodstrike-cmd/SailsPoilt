@@ -10,6 +10,21 @@ interface FirebaseServiceAccountLike {
   private_key?: string;
 }
 
+export type FirebaseAdminErrorKind =
+  | "missing_firebase_service_account"
+  | "invalid_firebase_service_account"
+  | "firebase_token_exchange_failed"
+  | "firebase_password_update_failed";
+
+export class FirebaseAdminError extends Error {
+  readonly kind: FirebaseAdminErrorKind;
+  constructor(kind: FirebaseAdminErrorKind) {
+    super(kind);
+    this.name = "FirebaseAdminError";
+    this.kind = kind;
+  }
+}
+
 function b64url(input: string | Uint8Array): string {
   const bytes = typeof input === "string" ? new TextEncoder().encode(input) : input;
   let binary = "";
@@ -19,9 +34,9 @@ function b64url(input: string | Uint8Array): string {
 
 async function getAccessToken(): Promise<string> {
   const keyJson = Deno.env.get("FIREBASE_SERVICE_ACCOUNT");
-  if (!keyJson) throw new Error("missing_firebase_service_account");
+  if (!keyJson) throw new FirebaseAdminError("missing_firebase_service_account");
   const key = JSON.parse(keyJson) as FirebaseServiceAccountLike;
-  if (!key.client_email || !key.private_key) throw new Error("invalid_firebase_service_account");
+  if (!key.client_email || !key.private_key) throw new FirebaseAdminError("invalid_firebase_service_account");
 
   const now = Math.floor(Date.now() / 1000);
   const header = b64url(JSON.stringify({ alg: "RS256", typ: "JWT" }));
@@ -53,9 +68,13 @@ async function getAccessToken(): Promise<string> {
       assertion: signedJwt,
     }),
   });
-  if (!res.ok) throw new Error("firebase_token_exchange_failed");
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    console.error("firebase token exchange failed", res.status, sanitizeErrorDetail(detail));
+    throw new FirebaseAdminError("firebase_token_exchange_failed");
+  }
   const body = (await res.json()) as { access_token?: string };
-  if (!body.access_token) throw new Error("firebase_token_exchange_failed");
+  if (!body.access_token) throw new FirebaseAdminError("firebase_token_exchange_failed");
   return body.access_token;
 }
 
@@ -70,19 +89,62 @@ function pemToPkcs8(pem: string): Uint8Array {
 /** Sets the real Firebase Auth password for the given uid. */
 export async function updateFirebasePassword(uid: string, newPassword: string): Promise<void> {
   const accessToken = await getAccessToken();
+  // Use the Admin REST endpoint, not the client SDK endpoint. The client
+  // endpoint (accounts:update?key=…) expects an idToken in the body, while the
+  // admin endpoint (projects/{projectId}/accounts:update) accepts localId +
+  // password with the OAuth2 Bearer token we minted from the service account.
   const res = await fetch(
-    `https://identitytoolkit.googleapis.com/v1/accounts:update?key=${Deno.env.get("FIREBASE_API_KEY") ?? ""}`,
+    `https://identitytoolkit.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/accounts:update`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
-      body: JSON.stringify({ localId: uid, password: newPassword, revokeRefreshTokens: true }),
+      body: JSON.stringify({ localId: uid, password: newPassword, disableUser: false, returnSecureToken: false }),
     }
   );
   if (!res.ok) {
     const detail = await res.text().catch(() => "");
     console.error("firebase password update failed", res.status, sanitizeErrorDetail(detail));
-    throw new Error("firebase_password_update_failed");
+    throw new FirebaseAdminError("firebase_password_update_failed");
   }
+}
+
+/**
+ * Looks up a Firebase user by email and returns their localId (uid). Used when
+ * the member row has no stored firebase_uid yet — the account exists in
+ * Firebase but hasn't been linked in our database.
+ */
+export async function lookupFirebaseUidByEmail(email: string): Promise<string | null> {
+  const accessToken = await getAccessToken();
+  const res = await fetch(
+    `https://identitytoolkit.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/accounts:lookup`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${accessToken}` },
+      body: JSON.stringify({ email: [email] }),
+    }
+  );
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    console.error("firebase user lookup failed", res.status, sanitizeErrorDetail(detail));
+    return null;
+  }
+  const body = (await res.json()) as { users?: { localId?: string }[] };
+  const user = body.users?.[0];
+  return user?.localId ?? null;
+}
+
+/**
+ * Updates a Firebase user's password by email. If the member row has no stored
+ * firebase_uid, looks it up from Firebase first, then updates the password.
+ * Returns the uid used so the caller can persist it.
+ */
+export async function updateFirebasePasswordByEmail(email: string, newPassword: string): Promise<string> {
+  const accessToken = await getAccessToken();
+  // Look up the user by email to get their localId.
+  const uid = await lookupFirebaseUidByEmail(email);
+  if (!uid) throw new FirebaseAdminError("firebase_password_update_failed");
+  await updateFirebasePassword(uid, newPassword);
+  return uid;
 }
 
 function sanitizeErrorDetail(detail: string): string {

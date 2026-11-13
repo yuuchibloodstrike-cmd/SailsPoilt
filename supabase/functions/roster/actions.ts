@@ -1,6 +1,6 @@
 import { db, MEMBER_SELECT, type MemberRow } from "./db.ts";
 import { HttpError } from "./http.ts";
-import { updateFirebasePassword } from "./firebaseAdmin.ts";
+import { FirebaseAdminError, updateFirebasePassword, updateFirebasePasswordByEmail } from "./firebaseAdmin.ts";
 import {
   consumeResetKey,
   findApprovedResetContext,
@@ -469,13 +469,23 @@ async function resetMemberPassword(actor: MemberRow, body: Record<string, unknow
   const newPassword = requireString(body.newPassword, "password");
   if (newPassword.length < 8) throw new HttpError(422, "password_too_short");
 
-  if (target.firebase_uid) {
-    try {
-      await updateFirebasePassword(target.firebase_uid, newPassword);
-    } catch (err) {
-      console.error("resetMemberPassword: firebase update failed", err instanceof Error ? err.message : err);
-      throw new HttpError(502, "firebase_update_failed");
+  try {
+    const uid = target.firebase_uid
+      ? await updateFirebasePassword(target.firebase_uid, newPassword).then(() => target.firebase_uid!)
+      : await updateFirebasePasswordByEmail(target.email, newPassword);
+    if (!target.firebase_uid) {
+      await db.from("members").update({ firebase_uid: uid, updated_at: new Date().toISOString() }).eq("id", id);
     }
+  } catch (err) {
+    if (err instanceof FirebaseAdminError) {
+      console.error("resetMemberPassword: firebase update failed", err.kind);
+      if (err.kind === "missing_firebase_service_account" || err.kind === "invalid_firebase_service_account" || err.kind === "firebase_token_exchange_failed") {
+        throw new HttpError(503, "firebase_not_configured");
+      }
+    } else {
+      console.error("resetMemberPassword: firebase update failed", err instanceof Error ? err.message : err);
+    }
+    throw new HttpError(502, "firebase_update_failed");
   }
 
   const { error } = await db
@@ -944,15 +954,28 @@ export async function completePasswordReset(body: Record<string, unknown>) {
     }
 
     const member = await loadMember(context.memberId);
-    if (!member.firebase_uid) throw new HttpError(422, "account_not_linked");
 
-    // Change the real Firebase password. On failure the token stays consumed;
-    // we release it so the requester can retry within the same window.
+    // Change the real Firebase password. If the member row has no stored
+    // firebase_uid, look it up from Firebase by email first, then persist it.
+    // On failure the token stays consumed; we release it so the requester can
+    // retry within the same window.
     try {
-      await updateFirebasePassword(member.firebase_uid, newPassword);
+      if (member.firebase_uid) {
+        await updateFirebasePassword(member.firebase_uid, newPassword);
+      } else {
+        const uid = await updateFirebasePasswordByEmail(member.email, newPassword);
+        await db.from("members").update({ firebase_uid: uid, updated_at: new Date().toISOString() }).eq("id", context.memberId);
+      }
     } catch (err) {
       await releaseResetKey(context.tokenId);
-      console.error("password reset: firebase update failed", err instanceof Error ? err.message : err);
+      if (err instanceof FirebaseAdminError) {
+        console.error("password reset: firebase update failed", err.kind);
+        if (err.kind === "missing_firebase_service_account" || err.kind === "invalid_firebase_service_account" || err.kind === "firebase_token_exchange_failed") {
+          throw new HttpError(503, "firebase_not_configured");
+        }
+      } else {
+        console.error("password reset: firebase update failed", err instanceof Error ? err.message : err);
+      }
       throw new HttpError(502, "firebase_update_failed");
     }
 
